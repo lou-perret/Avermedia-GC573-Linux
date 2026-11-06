@@ -3005,10 +3005,89 @@ static int audio_open_device(struct audio_playback *playback,
 }
 
 /*
- * The FPGA always stores 16- or 24-bit little-endian samples in the same
- * channel layout the kernel driver exposes.  Playback is stereo, so keep
- * the first two HDMI slots (FL/FR); 5.1/7.1 sources therefore downmix to
- * their front pair instead of failing.
+ * Stereo downmix gains for multichannel LPCM.  The IT6805 only reports which
+ * channel pairs are present (not the Audio InfoFrame allocation), so assume
+ * 5.1 for 6 ch and 7.1 for 8 ch.  The DMA slot order is NOT the HDMI/CEA-861
+ * one (FL FR LFE FC SL SR) but the WAV/ALSA one: a per-slot level trace
+ * (GC573_AUDIO_SLOT_TRACE=1) of the Nintendo Switch 2 speaker test
+ * (L, C, R, SR, SL, SW) measured FL FR FC LFE SL SR.  Slots 6/7 (7.1) are
+ * not verified yet; they are mixed to the left/right side respectively,
+ * which holds for either WAV order (BL BR or SL SR).  Mirrors
+ * libswresample's defaults used by the AC-3/DTS decoder: centre and surrounds
+ * at -3 dB, LFE dropped, normalised so the mix can never clip.
+ */
+static void pcm_downmix_gains(unsigned int channels, float gl[8], float gr[8])
+{
+	const float m3db = 0.70710678f;
+	float sum = 1.0f;
+
+	memset(gl, 0, 8 * sizeof(float));
+	memset(gr, 0, 8 * sizeof(float));
+	gl[0] = 1.0f;
+	gr[1] = 1.0f;
+	if (channels < 6)
+		return;
+
+	gl[2] = gr[2] = m3db;			/* FC */
+	/* slot 3 = LFE: dropped */
+	gl[4] = m3db;				/* SL */
+	gr[5] = m3db;				/* SR */
+	sum += 2.0f * m3db;
+	if (channels >= 8) {
+		gl[6] = m3db;			/* RL */
+		gr[7] = m3db;			/* RR */
+		sum += m3db;
+	}
+	for (unsigned int slot = 0; slot < 8; slot++) {
+		gl[slot] /= sum;
+		gr[slot] /= sum;
+	}
+}
+
+/* Per-slot peak of multichannel LPCM, logged with GC573_AUDIO_SLOT_TRACE=1. */
+static uint32_t g_pcm_slot_peak[8];
+/* Sign changes per slot (~2x the dominant frequency over one second). */
+static uint32_t g_pcm_slot_zc[8];
+static int32_t g_pcm_slot_last[8];
+
+static int32_t pcm_read_sample(const uint8_t *p, unsigned int bytes)
+{
+	if (bytes == 2)
+		return (int16_t)(p[0] | p[1] << 8);
+	/* S24_3LE, sign-extended. */
+	return (int32_t)((uint32_t)p[0] << 8 | (uint32_t)p[1] << 16 |
+			 (uint32_t)p[2] << 24) >> 8;
+}
+
+static void pcm_write_sample(uint8_t *o, unsigned int out_bytes, float v,
+			     float full_scale)
+{
+	int32_t s;
+
+	if (v > full_scale - 1.0f)
+		v = full_scale - 1.0f;
+	else if (v < -full_scale)
+		v = -full_scale;
+	s = (int32_t)lrintf(v);
+	if (out_bytes == 2) {
+		o[0] = (uint8_t)s;
+		o[1] = (uint8_t)(s >> 8);
+	} else {
+		/* S24 value -> S32LSB with the low byte zero. */
+		uint32_t u = (uint32_t)s << 8;
+
+		o[0] = (uint8_t)u;
+		o[1] = (uint8_t)(u >> 8);
+		o[2] = (uint8_t)(u >> 16);
+		o[3] = (uint8_t)(u >> 24);
+	}
+}
+
+/*
+ * The FPGA always stores 16- or 24-bit little-endian samples, FL/FR first
+ * (see pcm_downmix_gains() for the measured 5.1 slot order).  Playback is
+ * stereo: 2.0 is copied as-is, 5.1/7.1 is mixed down with pcm_downmix_gains()
+ * instead of dropping everything but FL/FR.
  */
 static size_t audio_convert_pcm(const struct gc573_user_audio *dma,
 				const void *src, size_t bytes,
@@ -3025,12 +3104,54 @@ static size_t audio_convert_pcm(const struct gc573_user_audio *dma,
 		return 0;
 
 	in_frame = dma->dma_channels * dma->sample_bytes;
-	out_sample_bytes = dma->sample_bits / 8U;
+	/* SDL plays 24-bit LPCM as S32LSB (see audio_open_device). */
+	out_sample_bytes = dma->sample_bits == 24 ? 4U : 2U;
 	out_frame = out_sample_bytes * 2U;
 	frames = (unsigned int)(bytes / in_frame);
 	out_bytes = (size_t)frames * out_frame;
 	if (!out_bytes || out_bytes > dst_size)
 		return 0;
+
+	if (dma->channels > 2 && dma->dma_channels >= dma->channels) {
+		float gl[8], gr[8];
+		float full_scale = out_sample_bytes == 2 ? 32768.0f : 8388608.0f;
+
+		pcm_downmix_gains(dma->channels, gl, gr);
+		for (unsigned int frame = 0; frame < frames; frame++) {
+			const uint8_t *p = in + (size_t)frame * in_frame;
+			uint8_t *o = dst + (size_t)frame * out_frame;
+			float l = 0.0f, r = 0.0f;
+
+			for (unsigned int slot = 0;
+			     slot < dma->dma_channels && slot < 8; slot++) {
+				int32_t s = pcm_read_sample(p + (size_t)slot *
+							    dma->sample_bytes,
+							    dma->sample_bytes);
+				uint32_t mag = s < 0 ? (uint32_t)-(int64_t)s : (uint32_t)s;
+				float v = (float)s;
+
+				/* Count only crossings of a real signal, not of noise. */
+				if (mag > 64) {
+					if ((s < 0) != (g_pcm_slot_last[slot] < 0))
+						__atomic_fetch_add(&g_pcm_slot_zc[slot], 1,
+								   __ATOMIC_RELAXED);
+					g_pcm_slot_last[slot] = s;
+				}
+				if (mag > __atomic_load_n(&g_pcm_slot_peak[slot],
+							  __ATOMIC_RELAXED))
+					__atomic_store_n(&g_pcm_slot_peak[slot], mag,
+							 __ATOMIC_RELAXED);
+				if (gl[slot] == 0.0f && gr[slot] == 0.0f)
+					continue;
+				l += v * gl[slot];
+				r += v * gr[slot];
+			}
+			pcm_write_sample(o, out_sample_bytes, l, full_scale);
+			pcm_write_sample(o + out_sample_bytes, out_sample_bytes,
+					 r, full_scale);
+		}
+		return out_bytes;
+	}
 
 	for (unsigned int frame = 0; frame < frames; frame++) {
 		for (unsigned int channel = 0; channel < 2; channel++) {
@@ -3792,6 +3913,10 @@ static void audio_handle_format(struct audio_stream *as,
 	as->format_rate = format->rate_hz;
 	as->format_channels = format->channels;
 	as->format_bits = format->sample_bits;
+	if (!bitstream && format->channels > 2)
+		printf("[AUDIO] LPCM %u ch (%s); downmixing to stereo\n",
+		       format->channels,
+		       format->channels >= 8 ? "7.1" : "5.1");
 	as->retry_after = 0;
 	if (as->lock_ready)
 		pthread_mutex_unlock(&as->lock);
@@ -5997,6 +6122,17 @@ int main(int argc, char *argv[])
 					       (unsigned long)audio.underruns,
 					       SDL_GetQueuedAudioSize(audio.playback.dev),
 					       audio.peak);
+					if (audio.format_channels > 2 && !audio.non_pcm &&
+					    getenv("GC573_AUDIO_SLOT_TRACE")) {
+						printf("[AUDIO] slot peaks:");
+						for (unsigned int s = 0; s < 8; s++)
+							printf(" %u=%u/%uHz", s,
+							       __atomic_exchange_n(&g_pcm_slot_peak[s], 0,
+									   __ATOMIC_RELAXED),
+							       __atomic_exchange_n(&g_pcm_slot_zc[s], 0,
+									   __ATOMIC_RELAXED) / 2U);
+						printf("\n");
+					}
 					audio.last_dma_blocks = audio.dma_blocks;
 					audio.last_queued_blocks =
 						audio.queued_blocks;
